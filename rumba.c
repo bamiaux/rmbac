@@ -459,21 +459,363 @@ static int self_test(void){
     return fail?1:0;
 }
 static char* trim_ws(char*s){while(*s&&isspace((unsigned char)*s))s++;char*e=s+strlen(s);while(e>s&&isspace((unsigned char)e[-1]))*--e=0;return s;}
-static int u64_qcmp(const void*aa,const void*bb){uint64_t a=*(const uint64_t*)aa,b=*(const uint64_t*)bb;return a<b?-1:a>b?1:0;}
 static uint64_t monotonic_ns(void){struct timespec ts;if(clock_gettime(CLOCK_MONOTONIC,&ts)!=0){perror("clock_gettime");exit(2);}return (uint64_t)ts.tv_sec*UINT64_C(1000000000)+(uint64_t)ts.tv_nsec;}
-static int run_corpus_file(const char*path,unsigned n){
-    FILE*f=fopen(path,"r");if(!f){perror(path);return 2;}char*line=NULL;size_t cap=0;ssize_t got;size_t count=0,okc=0,okzc=0,ngc=0,tcap=0;uint64_t*times=NULL,total_ns=0;
-    while((got=getline(&line,&cap,f))>=0){(void)got;char*src=trim_ws(line);if(!*src)continue;char*comma=strchr(src,',');if(!comma){fprintf(stderr,"%s:%zu: expected two CSV columns\n",path,count+1);free(line);free(times);fclose(f);return 2;}*comma=0;char*mba_s=trim_ws(src),*gt_s=trim_ws(comma+1);count++;
-        Rumba r;arena_init(&r.arena);char err[256]={0};Expr*mba=parse_expr(&r,mba_s,err,sizeof err);if(!mba){fprintf(stderr,"%s:%zu mba parse: %s\n",path,count,err);ngc++;arena_reset(&r.arena);continue;}Expr*gt=parse_expr(&r,gt_s,err,sizeof err);if(!gt){fprintf(stderr,"%s:%zu gt parse: %s\n",path,count,err);ngc++;arena_reset(&r.arena);continue;}
-        bool sok=true;uint64_t t0=monotonic_ns();Expr*sm=simplify(&r,mba,n,&sok);uint64_t dt=monotonic_ns()-t0;if(count>tcap){tcap=tcap?tcap*2:1024;while(tcap<count)tcap*=2;times=realloc(times,tcap*sizeof(*times));}times[count-1]=dt;total_ns+=dt;if(!sok){ngc++;arena_reset(&r.arena);continue;}
-        bool gok=true;Expr*sg=simplify(&r,gt,n,&gok);if(gok&&ex_eq(sm,sg)){okc++;arena_reset(&r.arena);continue;}
-        bool dok=true;Expr*diff=reduce_m(&r,ex2(&r,E_ADD,mba,ex_neg(&r,gt)),mask_n(n));Expr*sd=simplify(&r,diff,n,&dok);if(dok&&sd->k==E_CONST&&((sd->u.c&mask_n(n))==0))okzc++;else ngc++;arena_reset(&r.arena);
-    }
-    fclose(f);free(line);if(!count){free(times);fprintf(stderr,"empty corpus\n");return 2;}qsort(times,count,sizeof(*times),u64_qcmp);uint64_t med=times[count/2],p95=times[(count*95)/100<count?(count*95)/100:count-1];printf("CORPUS %s count=%zu OK=%zu OKZ=%zu NG=%zu median=%.3f us p95=%.3f us total=%.3f ms\n",path,count,okc,okzc,ngc,(double)med/1e3,(double)p95/1e3,(double)total_ns/1e6);free(times);return ngc?1:0;
+
+#define CORPUS_SEMANTIC_TESTS 200
+#define CORPUS_MEASURED_RUNS 5
+#define CORPUS_DATASET_COUNT 7
+
+typedef struct { const char *name, *file; size_t expected_count; } CorpusDataset;
+static const CorpusDataset corpus_datasets[CORPUS_DATASET_COUNT] = {
+    {"loki_tiny", "loki_tiny.csv", 25000},
+    {"mba_flatten", "mba_flatten.csv", 3000},
+    {"mba_obf_linear", "mba_obf_linear.csv", 1000},
+    {"mba_obf_nonlinear", "mba_obf_nonlinear.csv", 1000},
+    {"neureduce", "neureduce.csv", 10000},
+    {"qsynth_ea", "qsynth_ea.csv", 500},
+    {"syntia", "syntia.csv", 500},
+};
+
+typedef struct {
+    uint64_t total, actual_ast, raw_ast;
+    size_t count, ok, okz, ng, wins, ties, losses;
+} QualityCounts;
+typedef struct { uint64_t ns; size_t dataset_index, row; } PerfSample;
+typedef struct {
+    uint64_t total_ns, p50_ns, p95_ns, p99_ns, max_ns;
+    size_t dataset_index, row;
+} PerfSummary;
+
+static bool csv_fields(char *line, const char **source, const char **target) {
+    char *comma = strchr(line, ',');
+    if (!comma) return false;
+    *comma = 0;
+    *source = trim_ws(line);
+    *target = trim_ws(comma + 1);
+    return **source != 0 && **target != 0;
 }
 
-static int run_quality_corpus_file(const char*path,unsigned n){FILE*f=fopen(path,"r");if(!f){perror(path);return 2;}char*line=NULL;size_t cap=0;ssize_t got;size_t count=0,okc=0,okzc=0,ngc=0,w=0,t=0,l=0;uint64_t ast=0,raw=0;while((got=getline(&line,&cap,f))>=0){(void)got;char*src=trim_ws(line);if(!*src)continue;char*comma=strchr(src,',');if(!comma)continue;*comma=0;char*a=trim_ws(src),*b=trim_ws(comma+1);count++;Rumba r;arena_init(&r.arena);char err[256]={0};Expr*m=parse_expr(&r,a,err,sizeof err),*g=parse_expr(&r,b,err,sizeof err);if(!m||!g){ngc++;arena_reset(&r.arena);continue;}size_t rc=ex_size(g);raw+=rc;bool so=true;Expr*sm=simplify(&r,m,n,&so);if(!so){ngc++;arena_reset(&r.arena);continue;}size_t ac=ex_size(sm);ast+=ac;if(ac<rc)w++;else if(ac==rc)t++;else l++;bool go=true;Expr*sg=simplify(&r,g,n,&go);if(go&&ex_eq(sm,sg)){okc++;arena_reset(&r.arena);continue;}bool d=true;Expr*sd=simplify(&r,reduce_m(&r,ex2(&r,E_ADD,m,ex_neg(&r,g)),mask_n(n)),n,&d);if(d&&sd->k==E_CONST&&((sd->u.c&mask_n(n))==0))okzc++;else ngc++;arena_reset(&r.arena);}free(line);fclose(f);printf("QUALITY %s count=%zu OK=%zu OKZ=%zu NG=%zu W=%zu T=%zu L=%zu AST=%" PRIu64 " RAW=%" PRIu64 "\n",path,count,okc,okzc,ngc,w,t,l,ast,raw);return ngc?1:0;}
+static char *corpus_path(const char *directory, const char *filename) {
+    size_t n = strlen(directory);
+    bool slash = n > 0 && directory[n - 1] == '/';
+    size_t size = n + (slash ? 0 : 1) + strlen(filename) + 1;
+    char *path = malloc(size);
+    if (!path) { perror("malloc"); exit(2); }
+    snprintf(path, size, "%s%s%s", directory, slash ? "" : "/", filename);
+    return path;
+}
 
+static void quality_record(QualityCounts *counts, size_t actual_ast, size_t raw_ast, int status) {
+    counts->total++;
+    counts->actual_ast += (uint64_t)actual_ast;
+    counts->raw_ast += (uint64_t)raw_ast;
+    if (actual_ast < raw_ast) counts->wins++;
+    else if (actual_ast == raw_ast) counts->ties++;
+    else counts->losses++;
+    if (status == 0) counts->ok++;
+    else if (status == 1) counts->okz++;
+    else counts->ng++;
+}
+
+static void quality_merge(QualityCounts *total, const QualityCounts *part) {
+    total->total += part->total;
+    total->actual_ast += part->actual_ast;
+    total->raw_ast += part->raw_ast;
+    total->ok += part->ok;
+    total->okz += part->okz;
+    total->ng += part->ng;
+    total->wins += part->wins;
+    total->ties += part->ties;
+    total->losses += part->losses;
+}
+
+static int run_dataset_quality(const CorpusDataset *dataset, const char *path, unsigned n, QualityCounts *counts) {
+    FILE *file = fopen(path, "r");
+    if (!file) { perror(path); return 2; }
+    char *line = NULL;
+    size_t cap = 0, line_number = 0;
+    ssize_t got;
+    int result = 0;
+    while ((got = getline(&line, &cap, file)) >= 0) {
+        (void)got;
+        line_number++;
+        char *trimmed = trim_ws(line);
+        if (!*trimmed) continue;
+        const char *source, *target;
+        if (!csv_fields(trimmed, &source, &target)) {
+            fprintf(stderr, "%s:%zu: expected two non-empty CSV columns\n", dataset->name, line_number);
+            result = 2;
+            break;
+        }
+        Rumba r;
+        arena_init(&r.arena);
+        char err[256] = {0};
+        Expr *mba = parse_expr(&r, source, err, sizeof err);
+        Expr *ground_truth = mba ? parse_expr(&r, target, err, sizeof err) : NULL;
+        if (!mba || !ground_truth) {
+            fprintf(stderr, "%s:%zu: parse failure: %s\n", dataset->name, line_number, err);
+            arena_reset(&r.arena);
+            result = 2;
+            break;
+        }
+
+        size_t raw_ast = ex_size(ground_truth);
+        bool simplify_ok = true;
+        Expr *candidate = simplify(&r, mba, n, &simplify_ok);
+        size_t actual_ast = simplify_ok ? ex_size(candidate) : ex_size(mba);
+        int status = 2;
+        if (simplify_ok) {
+            if (!sem_equal(candidate, ground_truth, n, CORPUS_SEMANTIC_TESTS)) {
+                char *candidate_text = ex_repr(candidate, n, false);
+                fprintf(stderr,
+                        "semantic mismatch: %s:%zu\nSOURCE: %s\nTARGET: %s\ncandidate: %s\n",
+                        dataset->name, line_number, source, target, candidate_text);
+                free(candidate_text);
+                arena_reset(&r.arena);
+                result = 3;
+                break;
+            }
+            bool target_ok = true;
+            Expr *simplified_target = simplify(&r, ground_truth, n, &target_ok);
+            if (target_ok && ex_eq(candidate, simplified_target)) {
+                status = 0;
+            } else if (target_ok) {
+                Expr *difference = reduce_m(&r, ex2(&r, E_ADD, mba, ex_neg(&r, ground_truth)), mask_n(n));
+                bool difference_ok = true;
+                Expr *simplified_difference = simplify(&r, difference, n, &difference_ok);
+                if (difference_ok && simplified_difference->k == E_CONST && simplified_difference->u.c == 0)
+                    status = 1;
+            }
+        }
+        quality_record(counts, actual_ast, raw_ast, status);
+        arena_reset(&r.arena);
+    }
+    free(line);
+    fclose(file);
+    if (result == 0 && dataset->expected_count != 0 && counts->total != dataset->expected_count) {
+        fprintf(stderr, "%s: expected %zu rows, got %" PRIu64 "\n", dataset->name, dataset->expected_count, counts->total);
+        result = 2;
+    }
+    return result;
+}
+
+static int perf_sample_cmp(const void *aa, const void *bb) {
+    const PerfSample *a = aa, *b = bb;
+    if (a->ns != b->ns) return a->ns < b->ns ? -1 : 1;
+    if (a->dataset_index != b->dataset_index) return a->dataset_index < b->dataset_index ? -1 : 1;
+    return a->row < b->row ? -1 : a->row > b->row ? 1 : 0;
+}
+
+static int u64_cmp(const void *aa, const void *bb) {
+    uint64_t a = *(const uint64_t *)aa, b = *(const uint64_t *)bb;
+    return a < b ? -1 : a > b ? 1 : 0;
+}
+
+static PerfSummary summarize_run(const PerfSample *samples, size_t count, uint64_t total_ns) {
+    PerfSample *sorted = malloc(count * sizeof(*sorted));
+    if (!sorted) { perror("malloc"); exit(2); }
+    memcpy(sorted, samples, count * sizeof(*sorted));
+    qsort(sorted, count, sizeof(*sorted), perf_sample_cmp);
+    size_t p50 = (50 * count + 99) / 100 - 1;
+    size_t p95 = (95 * count + 99) / 100 - 1;
+    size_t p99 = (99 * count + 99) / 100 - 1;
+    PerfSummary out = {
+        .total_ns = total_ns, .p50_ns = sorted[p50].ns, .p95_ns = sorted[p95].ns,
+        .p99_ns = sorted[p99].ns, .max_ns = sorted[count - 1].ns,
+        .dataset_index = sorted[count - 1].dataset_index, .row = sorted[count - 1].row,
+    };
+    free(sorted);
+    return out;
+}
+
+static uint64_t median_u64(const uint64_t values[CORPUS_MEASURED_RUNS]) {
+    uint64_t sorted[CORPUS_MEASURED_RUNS];
+    memcpy(sorted, values, sizeof sorted);
+    qsort(sorted, CORPUS_MEASURED_RUNS, sizeof(*sorted), u64_cmp);
+    return sorted[CORPUS_MEASURED_RUNS / 2];
+}
+
+static int summary_max_cmp(const void *aa, const void *bb) {
+    const PerfSummary *a = aa, *b = bb;
+    if (a->max_ns != b->max_ns) return a->max_ns < b->max_ns ? -1 : 1;
+    if (a->dataset_index != b->dataset_index) return a->dataset_index < b->dataset_index ? -1 : 1;
+    return a->row < b->row ? -1 : a->row > b->row ? 1 : 0;
+}
+
+static PerfSummary median_summary(const PerfSummary runs[CORPUS_MEASURED_RUNS]) {
+    uint64_t total[CORPUS_MEASURED_RUNS], p50[CORPUS_MEASURED_RUNS];
+    uint64_t p95[CORPUS_MEASURED_RUNS], p99[CORPUS_MEASURED_RUNS];
+    PerfSummary maxima[CORPUS_MEASURED_RUNS];
+    for (size_t i = 0; i < CORPUS_MEASURED_RUNS; i++) {
+        total[i] = runs[i].total_ns; p50[i] = runs[i].p50_ns;
+        p95[i] = runs[i].p95_ns; p99[i] = runs[i].p99_ns;
+        maxima[i] = runs[i];
+    }
+    qsort(maxima, CORPUS_MEASURED_RUNS, sizeof(*maxima), summary_max_cmp);
+    PerfSummary out = maxima[CORPUS_MEASURED_RUNS / 2];
+    out.total_ns = median_u64(total); out.p50_ns = median_u64(p50);
+    out.p95_ns = median_u64(p95); out.p99_ns = median_u64(p99);
+    return out;
+}
+
+static int run_dataset_benchmark(const CorpusDataset *dataset, size_t dataset_index, const char *path,
+                                 size_t global_offset, PerfSample *global_samples[CORPUS_MEASURED_RUNS],
+                                 uint64_t global_totals[CORPUS_MEASURED_RUNS], PerfSummary *summary) {
+    PerfSummary runs[CORPUS_MEASURED_RUNS];
+    for (size_t run = 0; run < CORPUS_MEASURED_RUNS; run++) {
+        FILE *file = fopen(path, "r");
+        if (!file) { perror(path); return 2; }
+        char *line = NULL;
+        size_t cap = 0, row = 0, line_number = 0;
+        ssize_t got;
+        uint64_t total_ns = 0;
+        PerfSample *samples = malloc(dataset->expected_count * sizeof(*samples));
+        if (!samples) { perror("malloc"); exit(2); }
+        int result = 0;
+        while ((got = getline(&line, &cap, file)) >= 0) {
+            (void)got; line_number++;
+            char *trimmed = trim_ws(line);
+            if (!*trimmed) continue;
+            const char *source, *target;
+            if (!csv_fields(trimmed, &source, &target)) {
+                fprintf(stderr, "%s:%zu: expected two non-empty CSV columns\n", dataset->name, line_number);
+                result = 2; break;
+            }
+            (void)target;
+            Rumba r; arena_init(&r.arena);
+            char err[256] = {0};
+            Expr *mba = parse_expr(&r, source, err, sizeof err);
+            if (!mba) {
+                fprintf(stderr, "%s:%zu: parse failure: %s\n", dataset->name, line_number, err);
+                arena_reset(&r.arena); result = 2; break;
+            }
+            bool simplify_ok = true;
+            uint64_t started = monotonic_ns();
+            (void)simplify(&r, mba, 64, &simplify_ok);
+            uint64_t elapsed = monotonic_ns() - started;
+            if (row >= dataset->expected_count) {
+                fprintf(stderr, "%s: more than %zu rows\n", dataset->name, dataset->expected_count);
+                arena_reset(&r.arena); result = 2; break;
+            }
+            samples[row] = (PerfSample){.ns = elapsed, .dataset_index = dataset_index, .row = line_number};
+            global_samples[run][global_offset + row] = samples[row];
+            row++; total_ns += elapsed;
+            arena_reset(&r.arena);
+        }
+        free(line); fclose(file);
+        if (result == 0 && row != dataset->expected_count) {
+            fprintf(stderr, "%s: expected %zu rows, got %zu\n", dataset->name, dataset->expected_count, row);
+            result = 2;
+        }
+        if (result != 0) { free(samples); return result; }
+        runs[run] = summarize_run(samples, row, total_ns);
+        global_totals[run] += total_ns;
+        free(samples);
+    }
+    *summary = median_summary(runs);
+    return 0;
+}
+
+static void print_quality_row(const char *name, const QualityCounts *counts) {
+    printf("%-20s %7" PRIu64 " %7zu %5zu %5zu %7zu %7zu %7zu %12" PRIu64 " %12" PRIu64 "\n",
+           name, counts->total, counts->ok, counts->okz, counts->ng, counts->wins, counts->ties,
+           counts->losses, counts->actual_ast, counts->raw_ast);
+    fflush(stdout);
+}
+
+static int run_quality_corpus_file(const char *path, unsigned n) {
+    const char *name = strrchr(path, '/');
+    name = name ? name + 1 : path;
+    size_t name_length = strlen(name);
+    if (name_length >= 4 && !strcmp(name + name_length - 4, ".csv")) name_length -= 4;
+    char *dataset_name = malloc(name_length + 1);
+    if (!dataset_name) { perror("malloc"); exit(2); }
+    memcpy(dataset_name, name, name_length);
+    dataset_name[name_length] = 0;
+    CorpusDataset dataset = {.name = dataset_name, .file = path, .expected_count = 0};
+    QualityCounts counts = {0};
+    printf("## Quality\n\nDataset              Total      OK   OKZ    NG     Win    Tied    Loss   Actual AST      Raw AST\n");
+    int result = run_dataset_quality(&dataset, path, n, &counts);
+    if (result == 0) print_quality_row(dataset.name, &counts);
+    free(dataset_name);
+    return result != 0 ? result : counts.ng == 0 ? 0 : 1;
+}
+
+static void format_duration(char out[32], uint64_t ns) {
+    if (ns >= UINT64_C(1000000000)) snprintf(out, 32, "%.2f s", (double)ns / 1e9);
+    else if (ns >= UINT64_C(100000000)) snprintf(out, 32, "%.0f ms", (double)ns / 1e6);
+    else if (ns >= UINT64_C(10000000)) snprintf(out, 32, "%.1f ms", (double)ns / 1e6);
+    else if (ns >= UINT64_C(1000000)) snprintf(out, 32, "%.2f ms", (double)ns / 1e6);
+    else if (ns >= UINT64_C(1000)) snprintf(out, 32, "%.0f µs", (double)ns / 1e3);
+    else snprintf(out, 32, "%" PRIu64 " ns", ns);
+}
+
+static void print_performance_row(const char *name, size_t count, const PerfSummary *summary) {
+    char total[32], p50[32], p95[32], p99[32], maximum[32];
+    format_duration(total, summary->total_ns); format_duration(p50, summary->p50_ns);
+    format_duration(p95, summary->p95_ns); format_duration(p99, summary->p99_ns);
+    format_duration(maximum, summary->max_ns);
+    double throughput = summary->total_ns ? (double)count * 1e9 / (double)summary->total_ns : 0.0;
+    printf("%-20s %12s %12.0f %12s %12s %12s %12s\n",
+           name, total, throughput, p50, p95, p99, maximum);
+    fflush(stdout);
+}
+
+static int run_corpus(const char *directory) {
+    const unsigned n = 64;
+    QualityCounts counts[CORPUS_DATASET_COUNT] = {{0}}, total_quality = {0};
+    size_t expected_total = 0;
+    for (size_t i = 0; i < CORPUS_DATASET_COUNT; i++) expected_total += corpus_datasets[i].expected_count;
+    printf("## Quality\n\nDataset              Total      OK   OKZ    NG     Win    Tied    Loss   Actual AST      Raw AST\n");
+    for (size_t i = 0; i < CORPUS_DATASET_COUNT; i++) {
+        char *path = corpus_path(directory, corpus_datasets[i].file);
+        int result = run_dataset_quality(&corpus_datasets[i], path, n, &counts[i]);
+        free(path);
+        if (result != 0) return result;
+        quality_merge(&total_quality, &counts[i]);
+        print_quality_row(corpus_datasets[i].name, &counts[i]);
+    }
+    if (total_quality.total != expected_total) {
+        fprintf(stderr, "corpus: expected %zu total rows, got %" PRIu64 "\n", expected_total, total_quality.total);
+        return 2;
+    }
+    print_quality_row("Total", &total_quality);
+
+    PerfSample *global_samples[CORPUS_MEASURED_RUNS];
+    uint64_t global_totals[CORPUS_MEASURED_RUNS] = {0};
+    for (size_t run = 0; run < CORPUS_MEASURED_RUNS; run++) {
+        global_samples[run] = malloc(expected_total * sizeof(*global_samples[run]));
+        if (!global_samples[run]) { perror("malloc"); exit(2); }
+    }
+    printf("\n## Performance\n\nRuns: %d measured per dataset (quality pass used as warm-up)\n\n",
+           CORPUS_MEASURED_RUNS);
+    printf("Dataset                      Time       Expr/s          p50          p95          p99          Max\n");
+    size_t global_offset = 0;
+    PerfSummary dataset_summaries[CORPUS_DATASET_COUNT];
+    for (size_t i = 0; i < CORPUS_DATASET_COUNT; i++) {
+        char *path = corpus_path(directory, corpus_datasets[i].file);
+        int result = run_dataset_benchmark(&corpus_datasets[i], i, path, global_offset,
+                                           global_samples, global_totals, &dataset_summaries[i]);
+        free(path);
+        if (result != 0) {
+            for (size_t run = 0; run < CORPUS_MEASURED_RUNS; run++) free(global_samples[run]);
+            return result;
+        }
+        print_performance_row(corpus_datasets[i].name, corpus_datasets[i].expected_count, &dataset_summaries[i]);
+        global_offset += corpus_datasets[i].expected_count;
+    }
+    PerfSummary global_runs[CORPUS_MEASURED_RUNS];
+    for (size_t run = 0; run < CORPUS_MEASURED_RUNS; run++)
+        global_runs[run] = summarize_run(global_samples[run], expected_total, global_totals[run]);
+    PerfSummary global = median_summary(global_runs);
+    print_performance_row("Total", expected_total, &global);
+    char slowest[64], maximum[32];
+    format_duration(maximum, global.max_ns);
+    snprintf(slowest, sizeof slowest, "%s:%zu", corpus_datasets[global.dataset_index].name, global.row);
+    printf("\nSlowest: %s (%s)\n", slowest, maximum);
+    for (size_t run = 0; run < CORPUS_MEASURED_RUNS; run++) free(global_samples[run]);
+    return total_quality.ng == 0 ? 0 : 1;
+}
 static int run_atom_carrier_corpus_file(const char*path,unsigned n){
     FILE*f=fopen(path,"r");if(!f){perror(path);return 2;}char*line=NULL;size_t cap=0;ssize_t got;size_t count=0,same=0,diff=0,same_n=0,diff_n=0;
     while((got=getline(&line,&cap,f))>=0){(void)got;char*src=trim_ws(line);if(!*src)continue;char*comma=strchr(src,',');if(!comma){free(line);fclose(f);return 2;}*comma=0;char*mba_s=trim_ws(src),*gt_s=trim_ws(comma+1);count++;Rumba r;arena_init(&r.arena);char err[256]={0};Expr*mba=parse_expr(&r,mba_s,err,sizeof err),*gt=parse_expr(&r,gt_s,err,sizeof err);if(!mba||!gt){diff++;arena_reset(&r.arena);continue;}
@@ -487,4 +829,73 @@ static int run_atom_carrier_corpus_file(const char*path,unsigned n){
     fclose(f);free(line);printf("ATOM_CARRIER %s count=%zu SAME=%zu DIFF=%zu SAME_N=%zu DIFF_N=%zu\n",path,count,same,diff,same_n,diff_n);return diff?1:0;
 }
 
-int main(int argc,char**argv){if(argc==2&&!strcmp(argv[1],"--self-test"))return self_test();unsigned n=32;bool hex=false,test=false;const char*src=NULL,*corpus=NULL,*atom_corpus=NULL,*quality_corpus=NULL;for(int i=1;i<argc;i++){if(!strcmp(argv[i],"--n")&&i+1<argc)n=(unsigned)strtoul(argv[++i],NULL,10);else if(!strcmp(argv[i],"--hex"))hex=true;else if(!strcmp(argv[i],"--test"))test=true;else if(!strcmp(argv[i],"--corpus")&&i+1<argc)corpus=argv[++i];else if(!strcmp(argv[i],"--atom-carrier-corpus")&&i+1<argc)atom_corpus=argv[++i];else if(!strcmp(argv[i],"--quality-corpus")&&i+1<argc)quality_corpus=argv[++i];else src=argv[i];}if(n==0||n>64){fprintf(stderr,"bit width must be 1..64\n");return 2;}if(atom_corpus)return run_atom_carrier_corpus_file(atom_corpus,n);if(quality_corpus)return run_quality_corpus_file(quality_corpus,n);if(corpus)return run_corpus_file(corpus,n);if(!src){fprintf(stderr,"usage: rumba-c [--n BITS] [--hex] [--test] 'expr' | --corpus file.csv\n");return 2;}Rumba r;arena_init(&r.arena);char err[256]={0};Expr*e=parse_expr(&r,src,err,sizeof err);if(!e){fprintf(stderr,"parse error: %s\n",err);arena_reset(&r.arena);return 2;}char*in=ex_repr(e,n,hex);printf("Simplify %s\n",in);free(in);bool ok=true;Expr*q=simplify(&r,e,n,&ok);if(!ok){fprintf(stderr,"solver rejected expression\n");arena_reset(&r.arena);return 1;}char*out=ex_repr(q,n,hex);printf("%s\n",out);free(out);if(test)printf("semantic random test: %s\n",sem_equal(e,q,n,10000)?"PASS":"FAIL");arena_reset(&r.arena);return 0;}
+int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--self-test")) return self_test();
+    unsigned n = 32;
+    bool n_explicit = false, hex = false, test = false;
+    const char *src = NULL, *corpus = NULL, *quality_corpus = NULL, *atom_corpus = NULL;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--n") && i + 1 < argc) {
+            n = (unsigned)strtoul(argv[++i], NULL, 10);
+            n_explicit = true;
+        } else if (!strcmp(argv[i], "--hex")) hex = true;
+        else if (!strcmp(argv[i], "--test")) test = true;
+        else if (!strcmp(argv[i], "--corpus")) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "usage: rumba-c --corpus DATASET_DIR\n");
+                return 2;
+            }
+            corpus = argv[++i];
+        } else if (!strcmp(argv[i], "--quality-corpus") && i + 1 < argc)
+            quality_corpus = argv[++i];
+        else if (!strcmp(argv[i], "--atom-carrier-corpus") && i + 1 < argc)
+            atom_corpus = argv[++i];
+        else src = argv[i];
+    }
+    if (corpus && quality_corpus) {
+        fprintf(stderr, "--corpus and --quality-corpus cannot be combined\n");
+        return 2;
+    }
+    if (corpus) {
+        if (n_explicit && n != 64) {
+            fprintf(stderr, "corpus mode always uses 64-bit expressions\n");
+            return 2;
+        }
+        return run_corpus(corpus);
+    }
+    if (n == 0 || n > 64) {
+        fprintf(stderr, "bit width must be 1..64\n");
+        return 2;
+    }
+    if (quality_corpus) return run_quality_corpus_file(quality_corpus, n);
+    if (atom_corpus) return run_atom_carrier_corpus_file(atom_corpus, n);
+    if (!src) {
+        fprintf(stderr, "usage: rumba-c [--n BITS] [--hex] [--test] 'expr' | --quality-corpus file.csv | --corpus DATASET_DIR\n");
+        return 2;
+    }
+    Rumba r;
+    arena_init(&r.arena);
+    char err[256] = {0};
+    Expr *e = parse_expr(&r, src, err, sizeof err);
+    if (!e) {
+        fprintf(stderr, "parse error: %s\n", err);
+        arena_reset(&r.arena);
+        return 2;
+    }
+    char *in = ex_repr(e, n, hex);
+    printf("Simplify %s\n", in);
+    free(in);
+    bool ok = true;
+    Expr *q = simplify(&r, e, n, &ok);
+    if (!ok) {
+        fprintf(stderr, "solver rejected expression\n");
+        arena_reset(&r.arena);
+        return 1;
+    }
+    char *out = ex_repr(q, n, hex);
+    printf("%s\n", out);
+    free(out);
+    if (test) printf("semantic random test: %s\n", sem_equal(e, q, n, 10000) ? "PASS" : "FAIL");
+    arena_reset(&r.arena);
+    return 0;
+}
